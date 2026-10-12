@@ -1,16 +1,32 @@
-from fastapi import FastAPI, File, Form, UploadFile,Depends
+from fastapi import FastAPI, File, Form, UploadFile,Depends,HTTPException
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy import create_engine
-# from sqlalchemy.orm import sessionMaker
 import os
 
+from helper.authHelper import hash_password,verify_password,create_token
+from database import Base, engine
+import tables.models  # registers the models on Base.metadata so create_all can see them
 
-DB_URL = ""
+from tables.models import UsersTable,UsersLog,fileAttachments
 
-engine = create_engine(DB_URL)
-
+from database import sessionLocal
 app = FastAPI()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+
+def get_db():
+    db = sessionLocal()
+    try:
+        yield db
+        
+    finally:
+        db.close()
+
+
+@app.on_event('startup')
+def startup():
+
+    print("triggering the startup command")
+    Base.metadata.create_all(bind=engine)
 
 
 @app.get("/")
@@ -18,30 +34,45 @@ def root():
     return {"message": "Server is running at port 3000"}
 
 
-
 @app.post('/login')
-def login(form_Data : OAuth2PasswordRequestForm = Depends()):
-    return{
-        "message":"login sucessfull",
-        "data":{
-            "username":form_Data.username,
-            "password":form_Data.password
-        }
+@app.post('/login')
+def login(form_Data: OAuth2PasswordRequestForm = Depends(), db = Depends(get_db)):
+    user = db.query(UsersTable).filter(UsersTable.username == form_Data.username).first()
+
+    if not user or not verify_password(form_Data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="invalid username or password")
+
+    return {
+        "access_token": create_token(user.id),
+        "token_type": "bearer",
     }
+
 @app.post('/sign-in')
-def sign_in(username:str,password:str,email:str):
-    return{
-        "message":"user sign-in successfull",
-        "data":{
-            "username":username,
-            "password":password,
-            "email":email
-        }
+def sign_in(username: str, password: str, email: str, db = Depends(get_db)):
+
+    if not username or not password or not email:
+        raise HTTPException(status_code=400, detail="required fields are not present")
+
+    existing = db.query(UsersTable).filter(UsersTable.email == email).first()
+    if existing:
+        return {"message": "user already exists"}
+
+    db.add(UsersTable(
+        username=username,
+        hashed_password=hash_password(password),
+        email=email,
+    ))
+    db.commit()
+
+    return {
+        "message": "user sign-in successfull",
+        "data": {"username": username, "email": email},
     }
+
     
 
 @app.post('/update-card')
-def update_card(name:str,description:str):
+def update_card(name:str,description:str,token = Depends(oauth2_scheme)):
     return{
         "message":"updated card details",
         "details":{
@@ -55,7 +86,8 @@ def update_card(name:str,description:str):
 def log_message(
     name: str = Form(...),
     description:str = Form(...),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    token = Depends(oauth2_scheme)
     ):
     print("recieved data from user structuring and saving data to db",name, description)
     print("recieved file name",file.filename)
