@@ -22,9 +22,10 @@ class UsersLog(BaseColumns):
     __tablename__ = "userlog"
 
     id = Column(Integer,primary_key=True,autoincrement=True)
-    user_id = Column(Integer,ForeignKey("users.id"))
-    email = Column(String)
-    hashed_password = Column(String)
+    log_name = Column(String)
+    log_description = Column(String)
+    user_id = user_id = Column(Integer,ForeignKey("users.id"))
+    fileAttachmentsId = Column(Integer)
 
 
 class fileAttachments(BaseColumns):
@@ -32,7 +33,6 @@ class fileAttachments(BaseColumns):
 
     id = Column(Integer,primary_key=True,autoincrement=True)
     user_id = Column(Integer,ForeignKey("users.id"))
-    log_id = Column(Integer,ForeignKey("userlog.id"))
     filePath = Column(String)
     fileType = Column(String)
  

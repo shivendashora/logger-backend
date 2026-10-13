@@ -1,0 +1,1 @@
+Nightly Postgres backup completed successfully.

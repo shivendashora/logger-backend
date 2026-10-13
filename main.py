@@ -1,6 +1,7 @@
 from fastapi import FastAPI, File, Form, UploadFile,Depends,HTTPException
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import os
 
@@ -10,8 +11,12 @@ from database import Base, engine
 import tables.models  # registers the models on Base.metadata so create_all can see them
 
 from tables.models import UsersTable,UsersLog,fileAttachments
-
+from helper.normalHelper import create_file_path, validate_upload, original_file_name
+from fastapi.responses import FileResponse
 from database import sessionLocal
+
+directory_path = r"C:\Users\shive\OneDrive\Desktop\react-revision\logger\logger-backend\Uploads" 
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -20,7 +25,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+# serve saved attachments at /uploads/<file name> so the frontend can show them
+os.makedirs(directory_path, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=directory_path), name="uploads")
+
+
+def file_url(file_path):
+    # turns a saved file's disk path into the URL it's served at
+    return f"/uploads/{os.path.basename(file_path)}" if file_path else None
+
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login"
+                                                                  )
 
 
 def get_db():
@@ -107,7 +123,63 @@ def sign_in(body: SignUpRequest, db = Depends(get_db)):
         "data": {"username": username, "email": email},
     }
 
-    
+
+
+@app.get('/get-logs')
+def getLogs(user = Depends(get_current_user),db = Depends(get_db)):
+
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="User does not exist"
+        )
+
+    # outer join so a log without an attachment still comes back (with file_path None)
+    data = (
+        db.query(UsersLog, fileAttachments.filePath, fileAttachments.fileType)
+        .outerjoin(fileAttachments, fileAttachments.id == UsersLog.fileAttachmentsId)
+        .filter(UsersLog.user_id == user.id)
+        .order_by(UsersLog.created_at.desc())
+        .all()
+    )
+
+    return {
+        "message":"Here are the logs",
+        "data":[
+            {
+                "id": log.id,
+                "name": log.log_name,
+                "description": log.log_description,
+                "file_path": file_path,
+                "file_url": file_url(file_path),
+                "file_type": file_type,
+                "created_at": log.created_at,
+            }
+            for log, file_path, file_type in data
+        ]
+    }
+
+
+@app.get('/logs/{log_id}/download')
+def download_log_file(log_id: int, user = Depends(get_current_user), db = Depends(get_db)):
+    # only the owner of the log can download its attachment
+    attachment = (
+        db.query(fileAttachments)
+        .join(UsersLog, UsersLog.fileAttachmentsId == fileAttachments.id)
+        .filter(UsersLog.id == log_id, UsersLog.user_id == user.id)
+        .first()
+    )
+
+    if not attachment or not os.path.exists(attachment.filePath):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # filename= makes the browser save it under its original name
+    return FileResponse(
+        attachment.filePath,
+        media_type=attachment.fileType,
+        filename=original_file_name(attachment.filePath),
+    )
+
 
 @app.post('/update-card')
 def update_card(name:str,description:str,user = Depends(get_current_user)):
@@ -120,18 +192,70 @@ def update_card(name:str,description:str,user = Depends(get_current_user)):
     }
 
 
+
 @app.post('/logFormData')
 def log_message(
     name: str = Form(...),
-    description:str = Form(...),
+    description: str = Form(...),
     file: UploadFile = File(...),
-    user = Depends(get_current_user)
-    ):
-    print("recieved data from user structuring and saving data to db",name, description)
-    print("recieved file name",file.filename)
+    user=Depends(get_current_user),
+    db=Depends(get_db)
+):
+    print(
+        "Received data:",
+        name,
+        description
+    )
+    print("Received file:", file.filename)
+
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="User does not exist"
+        )
+
+    file_attachment = None
+
+    if file and file.filename:
+        # reject anything that isn't a real PDF or image before it touches the disk
+        try:
+            file_type = validate_upload(file)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        response = create_file_path(file, directory_path)
+
+        if response:
+            file_attachment = fileAttachments(
+                user_id=user.id,
+                filePath=response,
+                fileType=file_type
+            )
+
+            db.add(file_attachment)
+            db.flush()
+
+    log_object = UsersLog(
+        log_name=name,
+        log_description=description,
+        user_id=user.id,
+        fileAttachmentsId=file_attachment.id if file_attachment else None
+    )
+
+    db.add(log_object)
+    db.commit()
+    db.refresh(log_object)
 
     return {
-        "message":"Message logged successfully ",
-        "data": {"name": name, "description": description}
+        "message": "Message logged successfully",
+        "data": {
+            "id": log_object.id,
+            "name": name,
+            "description": description,
+            "file_path": response if file_attachment else None,
+            "file_url": file_url(response) if file_attachment else None,
+            "file_type": file_attachment.fileType if file_attachment else None
+        }
     }
+
 
