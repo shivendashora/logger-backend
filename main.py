@@ -92,8 +92,6 @@ def get_current_user(token: str = Depends(oauth2_scheme), db = Depends(get_db)):
 
 @app.on_event('startup')
 def startup():
-
-    print("triggering the startup command")
     Base.metadata.create_all(bind=engine)
 
 
@@ -263,14 +261,54 @@ def delete_logs(body: DeleteLogsRequest, user = Depends(get_current_user), db = 
     }
 
 
-@app.post('/update-card')
-def update_card(name:str,description:str,user = Depends(get_current_user)):
-    return{
-        "message":"updated card details",
-        "details":{
-            "name":name,
-            "description":description
-        }
+@app.get('/logs/{log_id}', response_model=LogItem)
+def get_log(log_id: int, user = Depends(get_current_user), db = Depends(get_db)):
+    # one log by id (used when a card page is opened directly); only the owner can read it
+    row = (
+        db.query(UsersLog, fileAttachments.filePath, fileAttachments.fileType)
+        .outerjoin(fileAttachments, fileAttachments.log_id == UsersLog.id)
+        .filter(UsersLog.id == log_id, UsersLog.user_id == user.id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Log not found")
+
+    log, file_path, file_type = row
+    return LogItem(
+        id=log.id,
+        name=log.log_name,
+        description=log.log_description,
+        file_path=file_path,
+        file_url=file_url(file_path),
+        file_type=file_type,
+        created_at=log.created_at,
+    )
+
+
+class UpdateLogRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(max_length=10000)
+
+
+@app.put('/logs/{log_id}')
+def update_log(log_id: int, body: UpdateLogRequest, user = Depends(get_current_user), db = Depends(get_db)):
+    # only the owner can edit; someone else's id looks the same as a missing one
+    log = db.query(UsersLog).filter(UsersLog.id == log_id, UsersLog.user_id == user.id).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Log not found")
+
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name can't be empty")
+
+    log.log_name = name
+    log.log_description = body.description
+    db.commit()
+    db.refresh(log)
+
+    return {
+        "message": "Log updated",
+        "data": {"id": log.id, "name": log.log_name, "description": log.log_description},
     }
 
 
@@ -283,13 +321,6 @@ def log_message(
     user=Depends(get_current_user),
     db=Depends(get_db)
 ):
-    print(
-        "Received data:",
-        name,
-        description
-    )
-    print("Received file:", file.filename)
-
     if not user:
         raise HTTPException(
             status_code=401,
