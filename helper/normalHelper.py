@@ -74,3 +74,25 @@ def create_file_path(file : UploadFile , directory_path:str):
         shutil.copyfileobj(file.file,destination)
 
     return filePath
+
+def clean_search_query(search_query: str) -> str:
+    """
+    Cleans the search query string:
+    - Strips leading/trailing spaces
+    - Collapses multiple spaces into one
+    - Removes dangerous characters for SQL injection
+    - Keeps only letters, numbers, spaces, and basic punctuation
+    """
+    if not search_query:
+        return ""
+
+    # Trim spaces
+    cleaned = search_query.strip()
+
+    # Collapse multiple spaces
+    cleaned = re.sub(r"\s+", " ", cleaned)
+
+    # Remove unwanted characters (keep alphanumeric, space, ., -, _, @)
+    cleaned = re.sub(r"[^a-zA-Z0-9\s\.\-\_@]", "", cleaned)
+
+    return cleaned
