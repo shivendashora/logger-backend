@@ -1,0 +1,28 @@
+# virtual environment
+venv/
+.venv/
+env/
+
+# python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# user-uploaded files (main.py recreates the folder on startup)
+Uploads/
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# logs
+*.log

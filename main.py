@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, File, Form, Query, UploadFile,Depends,HTTPException
@@ -6,17 +7,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import os
-from sqlalchemy import or_
+from sqlalchemy import insert, or_, select
 
 from helper.authHelper import hash_password,verify_password,create_token,parse_jwt
 from jwt import ExpiredSignatureError,InvalidTokenError
-from database import Base, engine
+from database import Base, engine, get_db_session
 import tables.models  # registers the models on Base.metadata so create_all can see them
 
 from tables.models import UsersTable,UsersLog,fileAttachments
 from helper.normalHelper import clean_search_query, create_file_path, validate_upload, original_file_name
 from fastapi.responses import FileResponse
-from database import sessionLocal
 
 
 class LogItem(BaseModel):
@@ -30,15 +30,27 @@ class LogItem(BaseModel):
 
 
 class PaginatedResponse(BaseModel):
-    offset: int = Field(0, ge=0)          # rows skipped
-    limit: int = Field(10, ge=1, le=50)   # rows per page
-    total: int                            # all of the user's logs, ignoring offset/limit
+    offset: int = Field(0, ge=0)          
+    limit: int = Field(10, ge=1, le=50)   
+    total: int                            
     data: list[LogItem]
 
 
 directory_path = r"C:\Users\shive\OneDrive\Desktop\react-revision\logger\logger-backend\Uploads" 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    yield
+
+    print("Disposing engine")
+    await engine.dispose()
+
+app = FastAPI(
+    lifespan=lifespan
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -60,16 +72,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login"
                                                                   )
 
 
-def get_db():
-    db = sessionLocal()
-    try:
-        yield db
-        
-    finally:
-        db.close()
 
-
-def get_current_user(token: str = Depends(oauth2_scheme), db = Depends(get_db)):
+async def get_current_user(token: str = Depends(oauth2_scheme), db = Depends(get_db_session)):
     # decodes the bearer token and loads its user; any failure is a 401
     credentials_error = HTTPException(
         status_code=401,
@@ -83,16 +87,13 @@ def get_current_user(token: str = Depends(oauth2_scheme), db = Depends(get_db)):
         raise credentials_error
 
     user_id = payload.get("sub")
-    user = db.query(UsersTable).filter(UsersTable.id == int(user_id)).first() if user_id else None
-    if not user:
-        raise credentials_error
 
-    return user
+    
 
+    query = select(UsersTable).where(UsersTable.id == int(user_id))
 
-@app.on_event('startup')
-def startup():
-    Base.metadata.create_all(bind=engine)
+    user = await db.execute(query)
+    return user.scalar_one_or_none() 
 
 
 @app.get("/")
@@ -100,11 +101,14 @@ def root():
     return {"message": "Server is running at port 3000"}
 
 @app.post('/login')
-def login(form_Data: OAuth2PasswordRequestForm = Depends(), db = Depends(get_db)):
+async def login(form_Data: OAuth2PasswordRequestForm = Depends(), db = Depends(get_db_session)):
     # the OAuth2 form field is called "username", but the frontend sends the email in it
-    user = db.query(UsersTable).filter(UsersTable.email == form_Data.username).first()
 
-    if not user or not verify_password(form_Data.password, user.hashed_password):
+    query = select(UsersTable).where(UsersTable.email == form_Data.username)
+    user =  await db.execute(query)
+    user = user.scalar_one_or_none()
+
+    if not user or not await verify_password(form_Data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="invalid username or password")
 
     return {
@@ -112,7 +116,6 @@ def login(form_Data: OAuth2PasswordRequestForm = Depends(), db = Depends(get_db)
         "access_token": create_token(user.id),
         "token_type": "bearer",
     }
-
 class SignUpRequest(BaseModel):
     username: str
     email: str
@@ -120,34 +123,40 @@ class SignUpRequest(BaseModel):
 
 
 @app.post('/sign-in')
-def sign_in(body: SignUpRequest, db = Depends(get_db)):
+async def sign_in(body: SignUpRequest, db = Depends(get_db_session)):
     username, email, password = body.username, body.email, body.password
 
     if not username or not password or not email:
         raise HTTPException(status_code=400, detail="required fields are not present")
 
-    existing = db.query(UsersTable).filter(UsersTable.email == email).first()
+    existing = await db.execute(select(UsersTable).where(UsersTable.email == email))
+    existing = existing.scalar_one_or_none()
     if existing:
         raise HTTPException(status_code=409, detail="user already exists")
 
-    db.add(UsersTable(
+    query = insert(UsersTable).values(
         username=username,
-        hashed_password=hash_password(password),
         email=email,
-    ))
-    db.commit()
+        hashed_password=await hash_password(password),
+    ).returning(UsersTable.username,UsersTable.email)
+
+    user = await db.execute(query)
+    user=user.one()
+
+    print(f'User created: {user}')
+    await db.commit()
 
     return {
         "message": "user sign-in successfull",
-        "data": {"username": username, "email": email},
+        "data": {"username": user.username, "email": user.email},
     }
 
 
 
-@app.get('/get-logs', response_model=PaginatedResponse)
-def getLogs(
+@app.get('/get-logs')
+async def getLogs(
     user = Depends(get_current_user),
-    db = Depends(get_db),
+    db = Depends(get_db_session),
     limit: int = Query(10, ge=1, le=50),
     offset: int = Query(0, ge=0),
     searchQuery: str | None = Query(None, max_length=100),
@@ -162,57 +171,51 @@ def getLogs(
     processedQuery = clean_search_query(searchQuery)
 
     # one base query, so the total and the page always use the same filters
-    logs_query = db.query(UsersLog).filter(UsersLog.user_id == user.id)
+    query = select(UsersLog).where(
+    UsersLog.user_id == user.id,
+    UsersLog.log_name.ilike(f"%{processedQuery}%") if processedQuery else True
+    ).order_by(UsersLog.created_at.desc()).offset(offset).limit(limit)
 
-    if processedQuery:
-        # case-insensitive search in the log's name or description
-        logs_query = logs_query.filter(or_(
-            UsersLog.log_name.icontains(processedQuery),
-            UsersLog.log_description.icontains(processedQuery),
-        ))
 
-    total = logs_query.count()
+    logs_query = await db.execute(query)
+    logs_query = logs_query.scalars().all()
 
-    # outer join so a log without an attachment still comes back (with file_path None);
-    # offset/limit run in SQL so only one page is loaded, and id breaks ties in created_at
-    data = (
-        logs_query
-        .outerjoin(fileAttachments, fileAttachments.log_id == UsersLog.id)
-        .add_columns(fileAttachments.filePath, fileAttachments.fileType)
-        .order_by(UsersLog.created_at.desc(), UsersLog.id.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
 
-    return PaginatedResponse(
-        offset=offset,
-        limit=limit,
-        total=total,
-        data=[
+    logData=[]
+
+    for log in logs_query:
+        attachment = await db.execute(select(fileAttachments).where(fileAttachments.log_id == log.id))
+        attachment = attachment.scalar_one_or_none()
+
+        logData.append(
             LogItem(
                 id=log.id,
                 name=log.log_name,
                 description=log.log_description,
-                file_path=file_path,
-                file_url=file_url(file_path),
-                file_type=file_type,
+                file_path=attachment.filePath if attachment else None,
+                file_url=file_url(attachment.filePath) if attachment else None,
+                file_type=attachment.fileType if attachment else None,
                 created_at=log.created_at,
             )
-            for log, file_path, file_type in data
-        ],
+        )
+
+    print(f"Total logs for user {user.id}:",len(logData))
+    return PaginatedResponse(
+        offset=offset,
+        limit=limit,
+        total=len(logData),
+        data=logData,
     )
 
 
 @app.get('/logs/{log_id}/download')
-def download_log_file(log_id: int, user = Depends(get_current_user), db = Depends(get_db)):
+async def download_log_file(log_id: int, user = Depends(get_current_user), db = Depends(get_db_session)):
     # only the owner of the log can download its attachment
     attachment = (
-        db.query(fileAttachments)
+        await db.execute(select(fileAttachments)
         .join(UsersLog, UsersLog.id == fileAttachments.log_id)
-        .filter(UsersLog.id == log_id, UsersLog.user_id == user.id)
-        .first()
-    )
+        .where(UsersLog.id == log_id, UsersLog.user_id == user.id))
+    ).scalars().first()
 
     if not attachment or not os.path.exists(attachment.filePath):
         raise HTTPException(status_code=404, detail="File not found")
@@ -230,23 +233,22 @@ class DeleteLogsRequest(BaseModel):
 
 
 @app.post('/logs/delete')
-def delete_logs(body: DeleteLogsRequest, user = Depends(get_current_user), db = Depends(get_db)):
+async def delete_logs(body: DeleteLogsRequest, user = Depends(get_current_user), db = Depends(get_db_session)):
     # filtering by user_id means ids belonging to someone else are silently skipped
-    logs = db.query(UsersLog).filter(UsersLog.id.in_(body.ids), UsersLog.user_id == user.id).all()
+    logs = (await db.execute(select(UsersLog).where(UsersLog.id.in_(body.ids), UsersLog.user_id == user.id))).scalars().all()
     if not logs:
         raise HTTPException(status_code=404, detail="No matching logs found")
 
     deleted_ids = [log.id for log in logs]
     # read the file paths first: the attachment rows disappear with their logs
-    file_paths = [
-        attachment.filePath
-        for attachment in db.query(fileAttachments).filter(fileAttachments.log_id.in_(deleted_ids)).all()
-    ]
+    file_paths = (
+        await db.execute(select(fileAttachments.filePath).where(fileAttachments.log_id.in_(deleted_ids)))
+    ).scalars().all()
 
     # ON DELETE CASCADE on fileAttachments.log_id removes the attachment rows in the database
     for log in logs:
-        db.delete(log)
-    db.commit()
+        await db.delete(log)
+    await db.commit()
 
     # remove files only after the commit, so a failed delete never loses a file that's still referenced
     for file_path in file_paths:
@@ -262,14 +264,14 @@ def delete_logs(body: DeleteLogsRequest, user = Depends(get_current_user), db = 
 
 
 @app.get('/logs/{log_id}', response_model=LogItem)
-def get_log(log_id: int, user = Depends(get_current_user), db = Depends(get_db)):
+async def get_log(log_id: int, user = Depends(get_current_user), db = Depends(get_db_session)):
     # one log by id (used when a card page is opened directly); only the owner can read it
+    # .first() on the result (not .scalars()) keeps the whole (log, file_path, file_type) row
     row = (
-        db.query(UsersLog, fileAttachments.filePath, fileAttachments.fileType)
+        await db.execute(select(UsersLog, fileAttachments.filePath, fileAttachments.fileType)
         .outerjoin(fileAttachments, fileAttachments.log_id == UsersLog.id)
-        .filter(UsersLog.id == log_id, UsersLog.user_id == user.id)
-        .first()
-    )
+        .where(UsersLog.id == log_id, UsersLog.user_id == user.id))
+    ).first()
     if not row:
         raise HTTPException(status_code=404, detail="Log not found")
 
@@ -291,9 +293,9 @@ class UpdateLogRequest(BaseModel):
 
 
 @app.put('/logs/{log_id}')
-def update_log(log_id: int, body: UpdateLogRequest, user = Depends(get_current_user), db = Depends(get_db)):
+async def update_log(log_id: int, body: UpdateLogRequest, user = Depends(get_current_user), db = Depends(get_db_session)):
     # only the owner can edit; someone else's id looks the same as a missing one
-    log = db.query(UsersLog).filter(UsersLog.id == log_id, UsersLog.user_id == user.id).first()
+    log = (await db.execute(select(UsersLog).where(UsersLog.id == log_id, UsersLog.user_id == user.id))).scalars().first()
     if not log:
         raise HTTPException(status_code=404, detail="Log not found")
 
@@ -303,8 +305,8 @@ def update_log(log_id: int, body: UpdateLogRequest, user = Depends(get_current_u
 
     log.log_name = name
     log.log_description = body.description
-    db.commit()
-    db.refresh(log)
+    await db.commit()
+    await db.refresh(log)
 
     return {
         "message": "Log updated",
@@ -314,12 +316,12 @@ def update_log(log_id: int, body: UpdateLogRequest, user = Depends(get_current_u
 
 
 @app.post('/logFormData')
-def log_message(
+async def log_message(
     name: str = Form(...),
     description: str = Form(...),
     file: UploadFile = File(...),
     user=Depends(get_current_user),
-    db=Depends(get_db)
+    db=Depends(get_db_session)
 ):
     if not user:
         raise HTTPException(
@@ -327,7 +329,7 @@ def log_message(
             detail="User does not exist"
         )
 
-    file_attachment = None
+    saved_path = None
 
     # validate before anything is written, so a bad file creates neither a log nor a file on disk
     file_type = None
@@ -339,39 +341,47 @@ def log_message(
             raise HTTPException(status_code=400, detail=str(e))
 
     # the log is created first so the attachment can point at it (fileAttachments.log_id)
-    log_object = UsersLog(
+    query = select(UsersLog).where(UsersLog.user_id == user.id, UsersLog.log_name == name)
+    existing_log = (await db.execute(query)).scalar_one_or_none()
+
+    if existing_log:
+        raise HTTPException(status_code=409, detail="Log with the same name already exists")
+    
+    query = insert(UsersLog).values(
         log_name=name,
         log_description=description,
         user_id=user.id,
-    )
-    db.add(log_object)
-    db.flush()
+    ).returning(UsersLog.id)
+
+    log_id = (await db.execute(query)).scalar()
 
     if file_type:
-        response = create_file_path(file, directory_path)
+        saved_path = await create_file_path(file, directory_path)
 
-        if response:
-            file_attachment = fileAttachments(
+        if saved_path:
+            query = insert(fileAttachments).values(
                 user_id=user.id,
-                log_id=log_object.id,
-                filePath=response,
+                log_id=log_id,
+                filePath=saved_path,
                 fileType=file_type
             )
-            db.add(file_attachment)
+            await db.execute(query)
 
-    db.commit()
-    db.refresh(log_object)
+    await db.commit()
 
     return {
         "message": "Message logged successfully",
         "data": {
-            "id": log_object.id,
+            "id": log_id,
             "name": name,
             "description": description,
-            "file_path": response if file_attachment else None,
-            "file_url": file_url(response) if file_attachment else None,
-            "file_type": file_attachment.fileType if file_attachment else None
+            "file_path": saved_path,
+            "file_url": file_url(saved_path),
+            "file_type": file_type if saved_path else None
         }
     }
 
 
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)

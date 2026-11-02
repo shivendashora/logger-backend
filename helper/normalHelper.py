@@ -1,11 +1,12 @@
 import re
-import shutil
 import uuid
 
+import aiofiles
 from fastapi import UploadFile
 import os
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 # extension -> the only MIME type that extension may contain
 ALLOWED_EXTENSIONS = {
@@ -62,7 +63,7 @@ def original_file_name(file_path: str) -> str:
     return re.sub(r"^[0-9a-f]{32}_", "", os.path.basename(file_path))
 
 
-def create_file_path(file : UploadFile , directory_path:str):
+async def create_file_path(file : UploadFile , directory_path:str):
     # saves the upload inside directory_path and returns the saved file's path
     os.makedirs(directory_path, exist_ok = True)
 
@@ -70,8 +71,13 @@ def create_file_path(file : UploadFile , directory_path:str):
     file_name = f"{uuid.uuid4().hex}_{os.path.basename(file.filename)}"
     filePath = os.path.join(directory_path, file_name)
 
-    with open(filePath,"wb") as destination:
-        shutil.copyfileobj(file.file,destination)
+    # validate_upload already read the header, so start copying from the beginning again
+    await file.seek(0)
+
+    # copy in 1 MB chunks so a large upload never sits fully in memory or blocks the event loop
+    async with aiofiles.open(filePath, "wb") as destination:
+        while chunk := await file.read(CHUNK_SIZE):
+            await destination.write(chunk)
 
     return filePath
 
