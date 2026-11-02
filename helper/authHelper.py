@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 
 import bcrypt
@@ -11,19 +12,22 @@ Access_token_expiry_time = 30
 
 
 
-def hash_password(password:str):
+# bcrypt is deliberately slow (~0.5s of CPU per call), so both functions run it on a worker thread;
+# called directly it would freeze the event loop and every other request with it
+
+async def hash_password(password:str):
      # return hashed password
 
      salt = bcrypt.gensalt()
-     hashed_password = bcrypt.hashpw(password.encode("utf-8"),salt)
+     hashed_password = await asyncio.to_thread(bcrypt.hashpw, password.encode("utf-8"), salt)
      return hashed_password.decode("utf-8")
 
 
-def verify_password(password:str,hashed_password:str):
-     # return hashed password
+async def verify_password(password:str,hashed_password:str):
+     # return True if the password matches the hash
 
-     return bcrypt.checkpw(
-          password.encode("utf-8"),hashed_password.encode("utf-8")
+     return await asyncio.to_thread(
+          bcrypt.checkpw, password.encode("utf-8"), hashed_password.encode("utf-8")
      )
 
 
